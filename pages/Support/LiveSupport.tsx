@@ -32,6 +32,7 @@ export const LiveSupport: React.FC = () => {
   const [otherTyping, setOtherTyping] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<any>(null);
+  const channelRef = useRef<any>(null);
 
   useEffect(() => {
     if (!user) {
@@ -87,7 +88,9 @@ export const LiveSupport: React.FC = () => {
         console.log('[LiveSupport] Loaded messages:', msgData?.length || 0);
 
         // Subscribe to new messages
-        channel = supabase.channel(`support_chat_${threadData.id}`)
+        channel = supabase.channel(`support_chat_${threadData.id}`, {
+          config: { broadcast: { self: true } }
+        })
           .on(
             'postgres_changes',
             {
@@ -103,6 +106,24 @@ export const LiveSupport: React.FC = () => {
                 return [...prev, payload.new];
               });
               setOtherTyping(false);
+              window.dispatchEvent(new Event('support-unread-updated'));
+            }
+          )
+          .on(
+            'postgres_changes',
+            {
+              event: 'UPDATE',
+              schema: 'public',
+              table: 'support_messages',
+              filter: `thread_id=eq.${threadData.id}`
+            },
+            (payload) => {
+              setMessages(prev => {
+                const exists = prev.some(m => m.id === payload.new.id);
+                if (!exists) return [...prev, payload.new];
+                return prev.map(m => (m.id === payload.new.id ? payload.new : m));
+              });
+              window.dispatchEvent(new Event('support-unread-updated'));
             }
           )
           .on('broadcast', { event: 'typing' }, (payload) => {
@@ -113,6 +134,7 @@ export const LiveSupport: React.FC = () => {
           .subscribe((status) => {
             console.log('[LiveSupport] Subscription status:', status);
           });
+        channelRef.current = channel;
       } catch (err: any) {
         console.error('[LiveSupport] Init error:', err);
         toast.error(err.message || 'Failed to connect');
@@ -128,8 +150,35 @@ export const LiveSupport: React.FC = () => {
         console.log('[LiveSupport] Unsubscribing from channel');
         supabase.removeChannel(channel);
       }
+      channelRef.current = null;
     };
   }, [user, navigate]);
+
+  useEffect(() => {
+    if (!thread?.id || loading) return;
+
+    const syncLatestMessages = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('support_messages')
+          .select('*')
+          .eq('thread_id', thread.id)
+          .order('created_at', { ascending: true });
+
+        if (error || !data) return;
+
+        setMessages(prev => {
+          if (data.length <= prev.length) return prev;
+          return data;
+        });
+      } catch {
+        // Silent fallback sync
+      }
+    };
+
+    const interval = setInterval(syncLatestMessages, 2500);
+    return () => clearInterval(interval);
+  }, [thread?.id, loading]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -140,7 +189,7 @@ export const LiveSupport: React.FC = () => {
   const handleTyping = () => {
     if (!isTyping) {
       setIsTyping(true);
-      supabase.channel(`support_chat_${user?.id}`).send({
+      channelRef.current?.send({
         type: 'broadcast',
         event: 'typing',
         payload: { typing: true, is_admin: false },
@@ -151,7 +200,7 @@ export const LiveSupport: React.FC = () => {
     
     typingTimeoutRef.current = setTimeout(() => {
       setIsTyping(false);
-      supabase.channel(`support_chat_${user?.id}`).send({
+      channelRef.current?.send({
         type: 'broadcast',
         event: 'typing',
         payload: { typing: false, is_admin: false },
