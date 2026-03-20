@@ -1,0 +1,66 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vexora - Everything You Need</title>
+    <link rel="dns-prefetch" href="//fonts.googleapis.com">
+    <link rel="dns-prefetch" href="//fonts.gstatic.com">
+    <link rel="dns-prefetch" href="//cdnjs.cloudflare.com">
+    <link rel="dns-prefetch" href="//ymgyekgmonqhehmnskcw.supabase.co">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+    <link rel="preconnect" href="https://ymgyekgmonqhehmnskcw.supabase.co" crossorigin>
+    <link rel="preload" as="style" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" onload="this.onload=null;this.rel='stylesheet'">
+    <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"></noscript>
+    <style>
+        :root {
+            --fk-blue: #2874f0;
+            --fk-yellow: #ff9f00;
+            --fk-orange: #fb641b;
+            --fk-green: #388e3c;
+        }
+
+        body {
+            font-family: 'Manrope', sans-serif;
+            background-color: #f1f3f6;
+            color: #212121;
+            margin: 0;
+            padding: 0;
+            overflow-x: hidden;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .fk-shadow {
+            box-shadow: 0 2px 4px 0 rgba(0,0,0,.08);
+        }
+
+        @media (max-width: 640px) {
+            .container-padding {
+                padding-left: 8px;
+                padding-right: 8px;
+            }
+        }
+
+        .btn-cart { background-color: var(--fk-yellow); color: #fff; }
+        .btn-buy { background-color: var(--fk-orange); color: #fff; }
+
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 10px; }
+        
+        input, button { outline: none !important; }
+
+        @media screen and (max-width: 768px) {
+          input, select, textarea { font-size: 16px !important; }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <!-- Entry point for the application -->
+    <script type="module" src="/index.tsx"></script>
+</body>
+</html>
+
