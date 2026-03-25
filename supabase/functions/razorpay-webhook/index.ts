@@ -44,6 +44,139 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   });
 }
 
+function toBase64Url(input: string | Uint8Array): string {
+  const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function pemToArrayBuffer(pem: string): ArrayBuffer {
+  const normalized = pem
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s+/g, "");
+
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function getFirebaseAccessToken(): Promise<{ accessToken: string; projectId: string } | null> {
+  const projectId = Deno.env.get("FIREBASE_PROJECT_ID") ?? "";
+  const clientEmail = Deno.env.get("FIREBASE_CLIENT_EMAIL") ?? "";
+  const privateKeyRaw = Deno.env.get("FIREBASE_PRIVATE_KEY") ?? "";
+  const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+
+  if (!projectId || !clientEmail || !privateKey) {
+    return null;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: clientEmail,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
+
+  const encodedHeader = toBase64Url(JSON.stringify(header));
+  const encodedPayload = toBase64Url(JSON.stringify(payload));
+  const unsignedToken = `${encodedHeader}.${encodedPayload}`;
+
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToArrayBuffer(privateKey),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(unsignedToken),
+  );
+
+  const jwt = `${unsignedToken}.${toBase64Url(new Uint8Array(signature))}`;
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    console.error("Failed to fetch Firebase access token", await tokenRes.text());
+    return null;
+  }
+
+  const tokenJson = await tokenRes.json();
+  const accessToken = String(tokenJson?.access_token ?? "");
+  if (!accessToken) return null;
+
+  return { accessToken, projectId };
+}
+
+async function sendFcmNotificationBatch(
+  tokens: string[],
+  title: string,
+  body: string,
+  data: Record<string, string>,
+): Promise<void> {
+  if (tokens.length === 0) return;
+
+  const auth = await getFirebaseAccessToken();
+  if (!auth) {
+    console.warn("Skipping FCM send because Firebase credentials are not configured");
+    return;
+  }
+
+  const endpoint = `https://fcm.googleapis.com/v1/projects/${auth.projectId}/messages:send`;
+
+  await Promise.all(tokens.map(async (token) => {
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${auth.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: {
+            token,
+            notification: { title, body },
+            data,
+            webpush: {
+              notification: {
+                title,
+                body,
+                icon: "/icons/icon-192x192.png",
+              },
+            },
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        console.error("FCM send failed", await response.text());
+      }
+    } catch (error) {
+      console.error("FCM send exception", error);
+    }
+  }));
+}
+
 serve(async (req: Request) => {
   try {
     if (req.method !== "POST") {
@@ -222,7 +355,7 @@ serve(async (req: Request) => {
 
       const { data: products, error: productsError } = await supabaseAdmin
         .from("products")
-        .select("id, price")
+        .select("id, price, seller_id, title")
         .in("id", productIdsToInsert);
       if (productsError) throw productsError;
       if (!products || products.length === 0) {
@@ -230,12 +363,22 @@ serve(async (req: Request) => {
       }
 
       const productPriceById = new Map<string, number>();
+      const productSellerById = new Map<string, string | null>();
+      const productTitleById = new Map<string, string>();
       for (const product of products) {
-        productPriceById.set(String(product.id), Number(product.price || 0));
+        const productId = String(product.id);
+        productPriceById.set(productId, Number(product.price || 0));
+        productSellerById.set(productId, product?.seller_id ? String(product.seller_id) : null);
+        productTitleById.set(productId, String(product?.title || "Product"));
       }
 
       const expandedRows = productIdsToInsert
-        .map((id: string) => ({ productId: id, unitPrice: productPriceById.get(id) ?? 0 }))
+        .map((id: string) => ({
+          productId: id,
+          unitPrice: productPriceById.get(id) ?? 0,
+          sellerId: productSellerById.get(id) ?? null,
+          title: productTitleById.get(id) ?? "Product",
+        }))
         .filter((row) => row.unitPrice >= 0);
       const subtotal = expandedRows.reduce((acc, row) => acc + row.unitPrice, 0);
 
@@ -320,6 +463,104 @@ serve(async (req: Request) => {
 
         const { error: legacyError } = await supabaseAdmin.from("orders").insert(legacyOrdersToInsert);
         if (legacyError) throw legacyError;
+      }
+
+      // In-app push notifications for admin/seller dashboards.
+      // Seller-owned products -> admin + seller, admin-owned products -> admin only.
+      try {
+        const sellerRecipientIds = Array.from(
+          new Set(
+            expandedRows
+              .map((row) => row.sellerId)
+              .filter((id): id is string => Boolean(id)),
+          ),
+        );
+
+        const { data: adminUsers } = await supabaseAdmin
+          .from("users")
+          .select("id, fcm_token")
+          .eq("role", "admin");
+
+        const { data: sellerUsers } = sellerRecipientIds.length > 0
+          ? await supabaseAdmin
+            .from("users")
+            .select("id, name, store_name, fcm_token")
+            .in("id", sellerRecipientIds)
+          : { data: [] as Array<{ id: string; name?: string | null; store_name?: string | null; fcm_token?: string | null }> };
+
+        const adminTokens = (adminUsers || [])
+          .map((row: any) => String(row?.fcm_token || "").trim())
+          .filter((token: string) => token.length > 0);
+        const sellerTokenRows = (sellerUsers || []).map((row: any) => ({
+          id: String(row?.id || ""),
+          token: String(row?.fcm_token || "").trim(),
+          name: String(row?.store_name || row?.name || "Seller").trim() || "Seller",
+        })).filter((row: { token: string }) => row.token.length > 0);
+
+        const totalItems = expandedRows.length;
+        const includesSellerProduct = sellerRecipientIds.length > 0;
+        const title = includesSellerProduct ? "New Seller Order" : "New Admin Product Order";
+        const orderedTitles = expandedRows.map((row) => row.title).filter(Boolean);
+        const titlesPreview = orderedTitles.slice(0, 2).join(", ");
+        const moreCount = Math.max(0, orderedTitles.length - 2);
+        const itemText = titlesPreview
+          ? `${titlesPreview}${moreCount > 0 ? ` +${moreCount} more` : ""}`
+          : `${totalItems} item(s)`;
+        const messageBody = includesSellerProduct
+          ? `New order received: ${itemText}`
+          : `Admin product order received: ${itemText}`;
+
+        await sendFcmNotificationBatch(
+          Array.from(new Set(adminTokens)),
+          title,
+          messageBody,
+          {
+            kind: "order_placed",
+            target_role: "admin",
+            payment_id: String(paymentId),
+            order_items: String(totalItems),
+            item_preview: itemText,
+          },
+        );
+
+        if (sellerTokenRows.length > 0) {
+          const sellerNameById = new Map<string, string>();
+          for (const row of sellerTokenRows) {
+            sellerNameById.set(row.id, row.name);
+          }
+
+          for (const sellerId of sellerRecipientIds) {
+            const tokensForSeller = sellerTokenRows
+              .filter((row: { id: string; token: string }) => row.id === sellerId)
+              .map((row: { id: string; token: string }) => row.token);
+            if (tokensForSeller.length === 0) continue;
+
+            const sellerItemTitles = expandedRows
+              .filter((row) => row.sellerId === sellerId)
+              .map((row) => row.title);
+            const sellerPreview = sellerItemTitles.slice(0, 2).join(", ");
+            const sellerMoreCount = Math.max(0, sellerItemTitles.length - 2);
+            const sellerItemText = sellerPreview
+              ? `${sellerPreview}${sellerMoreCount > 0 ? ` +${sellerMoreCount} more` : ""}`
+              : `${sellerItemTitles.length || totalItems} item(s)`;
+            const sellerDisplayName = sellerNameById.get(sellerId) || "Seller";
+
+            await sendFcmNotificationBatch(
+              Array.from(new Set(tokensForSeller)),
+              "New Order On Your Product",
+              `${sellerDisplayName}, new order: ${sellerItemText}`,
+              {
+                kind: "order_placed",
+                target_role: "seller",
+                payment_id: String(paymentId),
+                order_items: String(sellerItemTitles.length || totalItems),
+                item_preview: sellerItemText,
+              },
+            );
+          }
+        }
+      } catch (notifyErr) {
+        console.error("Order notification dispatch failed", notifyErr);
       }
     }
 
